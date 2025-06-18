@@ -9,22 +9,7 @@ import 'package:permission_handler/permission_handler.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Request required permissions
-  final statuses =
-      await [
-        Permission.camera,
-        Permission.microphone,
-        Permission.photos,
-        Permission.sensors,
-      ].request();
-
-  // Check camera permission
-  if (!statuses[Permission.camera]!.isGranted) {
-    await openAppSettings();
-    return;
-  }
-
-  // Obtain a list of the available cameras on the device.
+  // Launch app; permissions will be requested in the first screen
   final cameras = await availableCameras();
   final firstCamera = cameras.firstWhere(
     (camera) => camera.lensDirection == CameraLensDirection.back,
@@ -35,7 +20,6 @@ Future<void> main() async {
 
 class MyApp extends StatelessWidget {
   final CameraDescription camera;
-
   const MyApp({super.key, required this.camera});
 
   @override
@@ -53,7 +37,6 @@ class MyApp extends StatelessWidget {
 
 class StreamingScreen extends StatefulWidget {
   final CameraDescription camera;
-
   const StreamingScreen({super.key, required this.camera});
 
   @override
@@ -61,8 +44,8 @@ class StreamingScreen extends StatefulWidget {
 }
 
 class _StreamingScreenState extends State<StreamingScreen> {
-  late CameraController _controller;
-  late Future<void> _initializeControllerFuture;
+  CameraController? _controller;
+  Future<void>? _initializeControllerFuture;
   WebSocketChannel? _channel;
   StreamSubscription<GyroscopeEvent>? _gyroscopeSubscription;
   Timer? _frameTimer;
@@ -75,26 +58,59 @@ class _StreamingScreenState extends State<StreamingScreen> {
   @override
   void initState() {
     super.initState();
+    _askPermissionsAndInit();
+    _gyroscopeSubscription = gyroscopeEvents.listen((event) {
+      if (mounted) setState(() => _gyroscopeEvent = event);
+    });
+  }
 
+  Future<void> _askPermissionsAndInit() async {
+    // Request camera and microphone permissions
+    final status = await [Permission.camera, Permission.microphone].request();
+    if (status[Permission.camera]!.isGranted &&
+        status[Permission.microphone]!.isGranted) {
+      _initializeCamera();
+    } else {
+      // Permission denied: show dialog then open settings
+      await showDialog(
+        context: context,
+        builder:
+            (ctx) => AlertDialog(
+              title: const Text('Permissions Required'),
+              content: const Text(
+                'Camera and microphone permissions are required to stream data.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Cancel'),
+                ),
+                TextButton(
+                  onPressed: () {
+                    openAppSettings();
+                    Navigator.of(ctx).pop();
+                  },
+                  child: const Text('Settings'),
+                ),
+              ],
+            ),
+      );
+    }
+  }
+
+  void _initializeCamera() {
     _controller = CameraController(
       widget.camera,
       ResolutionPreset.medium,
       enableAudio: true,
     );
-    _initializeControllerFuture = _controller.initialize();
-
-    _gyroscopeSubscription = gyroscopeEvents.listen((event) {
-      if (mounted) {
-        setState(() {
-          _gyroscopeEvent = event;
-        });
-      }
-    });
+    _initializeControllerFuture = _controller!.initialize();
+    setState(() {});
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    _controller?.dispose();
     _gyroscopeSubscription?.cancel();
     _frameTimer?.cancel();
     _channel?.sink.close();
@@ -120,22 +136,17 @@ class _StreamingScreenState extends State<StreamingScreen> {
       }
 
       final wsUrl = 'ws://$ip:8765';
-      setState(() {
-        _statusText = 'Connecting to $wsUrl...';
-      });
+      setState(() => _statusText = 'Connecting to $wsUrl...');
 
       try {
         _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
-        _channel!.sink.done.then((_) {});
         setState(() {
           _isStreaming = true;
           _statusText = 'Connected and streaming';
         });
         _startFrameTimer();
       } catch (e) {
-        setState(() {
-          _statusText = 'Connection Failed: $e';
-        });
+        setState(() => _statusText = 'Connection Failed: $e');
       }
     }
   }
@@ -148,9 +159,9 @@ class _StreamingScreenState extends State<StreamingScreen> {
   }
 
   Future<void> _sendData() async {
-    if (!_controller.value.isInitialized || !_isStreaming) return;
+    if (_controller == null || !_isStreaming) return;
     try {
-      final image = await _controller.takePicture();
+      final image = await _controller!.takePicture();
       final bytes = await image.readAsBytes();
       final base64Image = base64Encode(bytes);
 
@@ -181,7 +192,11 @@ class _StreamingScreenState extends State<StreamingScreen> {
               child: FutureBuilder<void>(
                 future: _initializeControllerFuture,
                 builder: (context, snapshot) {
-                  if (snapshot.connectionState == ConnectionState.done) {
+                  if (_initializeControllerFuture == null) {
+                    return const Center(
+                      child: Text('Waiting for permissions...'),
+                    );
+                  } else if (snapshot.connectionState == ConnectionState.done) {
                     return Container(
                       decoration: BoxDecoration(
                         border: Border.all(
@@ -192,7 +207,7 @@ class _StreamingScreenState extends State<StreamingScreen> {
                       ),
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(5),
-                        child: CameraPreview(_controller),
+                        child: CameraPreview(_controller!),
                       ),
                     );
                   } else {
