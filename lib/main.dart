@@ -4,16 +4,28 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
 
-void main() async {
-  // Ensure that plugin services are initialized so that `availableCameras()`
-  // can be called before `runApp()`
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Request required permissions
+  final statuses =
+      await [
+        Permission.camera,
+        Permission.microphone,
+        Permission.photos,
+        Permission.sensors,
+      ].request();
+
+  // Check camera permission
+  if (!statuses[Permission.camera]!.isGranted) {
+    await openAppSettings();
+    return;
+  }
 
   // Obtain a list of the available cameras on the device.
   final cameras = await availableCameras();
-
-  // Get a specific camera from the list of available cameras.
   final firstCamera = cameras.firstWhere(
     (camera) => camera.lensDirection == CameraLensDirection.back,
   );
@@ -53,122 +65,93 @@ class _StreamingScreenState extends State<StreamingScreen> {
   late Future<void> _initializeControllerFuture;
   WebSocketChannel? _channel;
   StreamSubscription<GyroscopeEvent>? _gyroscopeSubscription;
+  Timer? _frameTimer;
 
   final TextEditingController _ipController = TextEditingController();
   bool _isStreaming = false;
   String _statusText = 'Disconnected';
-  // Corrected: Added DateTime.now() for the timestamp
   GyroscopeEvent _gyroscopeEvent = GyroscopeEvent(0, 0, 0, DateTime.now());
-
-  // We will send frames at a controlled rate
-  Timer? _frameTimer;
 
   @override
   void initState() {
     super.initState();
+
     _controller = CameraController(
       widget.camera,
-      // Set a lower resolution to reduce latency.
-      // The python server will resize it anyway.
       ResolutionPreset.medium,
-      enableAudio: false,
+      enableAudio: true,
     );
-
     _initializeControllerFuture = _controller.initialize();
 
-    // Listen to gyroscope events
-    _gyroscopeSubscription = gyroscopeEvents.listen((GyroscopeEvent event) {
+    _gyroscopeSubscription = gyroscopeEvents.listen((event) {
       if (mounted) {
         setState(() {
           _gyroscopeEvent = event;
         });
       }
     });
+  }
 
-    // For debugging, you can pre-fill an IP
-    // _ipController.text = "192.168.1.10";
+  @override
+  void dispose() {
+    _controller.dispose();
+    _gyroscopeSubscription?.cancel();
+    _frameTimer?.cancel();
+    _channel?.sink.close();
+    _ipController.dispose();
+    super.dispose();
   }
 
   void _toggleStreaming() {
     if (_isStreaming) {
-      // Stop streaming
       _frameTimer?.cancel();
       _channel?.sink.close();
-      if (mounted) {
-        setState(() {
-          _isStreaming = false;
-          _statusText = 'Disconnected';
-        });
-      }
+      setState(() {
+        _isStreaming = false;
+        _statusText = 'Disconnected';
+      });
     } else {
-      // Start streaming
       final ip = _ipController.text;
       if (ip.isEmpty) {
-        // Show an error or a snackbar
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Please enter the server IP address')),
         );
         return;
       }
 
-      final wsUrl = "ws://$ip:8765";
-      if (mounted) {
-        setState(() {
-          _statusText = 'Connecting to $wsUrl...';
-        });
-      }
+      final wsUrl = 'ws://$ip:8765';
+      setState(() {
+        _statusText = 'Connecting to $wsUrl...';
+      });
 
       try {
         _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
-        _channel!.ready
-            .then((_) {
-              if (mounted) {
-                setState(() {
-                  _isStreaming = true;
-                  _statusText = 'Connected and streaming';
-                });
-                // Start sending frames at a fixed interval (e.g., 15 FPS)
-                _startFrameTimer();
-              }
-            })
-            .catchError((error) {
-              if (mounted) {
-                setState(() {
-                  _statusText = 'Connection Failed: $error';
-                });
-              }
-            });
+        _channel!.sink.done.then((_) {});
+        setState(() {
+          _isStreaming = true;
+          _statusText = 'Connected and streaming';
+        });
+        _startFrameTimer();
       } catch (e) {
-        if (mounted) {
-          setState(() {
-            _statusText = 'Invalid WebSocket URL';
-          });
-        }
+        setState(() {
+          _statusText = 'Connection Failed: $e';
+        });
       }
     }
   }
 
   void _startFrameTimer() {
-    // Send data every ~66ms, which is about 15 FPS
-    _frameTimer = Timer.periodic(const Duration(milliseconds: 66), (timer) {
-      if (!_isStreaming) {
-        timer.cancel();
-        return;
-      }
+    _frameTimer = Timer.periodic(const Duration(milliseconds: 66), (_) {
+      if (!_isStreaming) return;
       _sendData();
     });
   }
 
   Future<void> _sendData() async {
-    if (!_controller.value.isInitialized || !_isStreaming || !mounted) {
-      return;
-    }
-
+    if (!_controller.value.isInitialized || !_isStreaming) return;
     try {
       final image = await _controller.takePicture();
       final bytes = await image.readAsBytes();
-
-      // The image from `takePicture` is already JPEG encoded.
       final base64Image = base64Encode(bytes);
 
       final data = {
@@ -182,18 +165,8 @@ class _StreamingScreenState extends State<StreamingScreen> {
 
       _channel?.sink.add(jsonEncode(data));
     } catch (e) {
-      print("Error sending data: $e");
+      debugPrint('Error sending data: $e');
     }
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    _gyroscopeSubscription?.cancel();
-    _frameTimer?.cancel();
-    _channel?.sink.close();
-    _ipController.dispose();
-    super.dispose();
   }
 
   @override
@@ -203,8 +176,7 @@ class _StreamingScreenState extends State<StreamingScreen> {
       body: Padding(
         padding: const EdgeInsets.all(16.0),
         child: Column(
-          children: <Widget>[
-            // Camera Preview
+          children: [
             Expanded(
               child: FutureBuilder<void>(
                 future: _initializeControllerFuture,
@@ -230,7 +202,6 @@ class _StreamingScreenState extends State<StreamingScreen> {
               ),
             ),
             const SizedBox(height: 16),
-            // IP Address Input
             TextField(
               controller: _ipController,
               decoration: const InputDecoration(
@@ -242,7 +213,6 @@ class _StreamingScreenState extends State<StreamingScreen> {
               enabled: !_isStreaming,
             ),
             const SizedBox(height: 16),
-            // Status and Gyro Data
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(8.0),
@@ -254,14 +224,15 @@ class _StreamingScreenState extends State<StreamingScreen> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      'Gyro X: ${_gyroscopeEvent.x.toStringAsFixed(2)}, Y: ${_gyroscopeEvent.y.toStringAsFixed(2)}, Z: ${_gyroscopeEvent.z.toStringAsFixed(2)}',
+                      'Gyro X: ${_gyroscopeEvent.x.toStringAsFixed(2)}, ' +
+                          'Y: ${_gyroscopeEvent.y.toStringAsFixed(2)}, ' +
+                          'Z: ${_gyroscopeEvent.z.toStringAsFixed(2)}',
                     ),
                   ],
                 ),
               ),
             ),
             const SizedBox(height: 16),
-            // Start/Stop Button
             ElevatedButton(
               onPressed: _toggleStreaming,
               style: ElevatedButton.styleFrom(
