@@ -8,97 +8,58 @@ import 'package:camera/camera.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
-Future<void> main() async {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // 1️⃣ Request runtime permissions
-  final camStatus = await Permission.camera.request();
-  final micStatus = await Permission.microphone.request();
-
-  // 2️⃣ Check both granted
-  if (camStatus.isGranted && micStatus.isGranted) {
-    try {
-      final cameras = await availableCameras();
-      final back = cameras.firstWhere(
-        (c) => c.lensDirection == CameraLensDirection.back,
-      );
-      runApp(MyApp(camera: back));
-    } catch (e) {
-      runApp(const PermissionErrorApp());
-    }
-  } else {
-    runApp(const PermissionErrorApp());
-  }
-}
-
-class PermissionErrorApp extends StatelessWidget {
-  const PermissionErrorApp({super.key});
-  @override
-  Widget build(BuildContext context) => MaterialApp(
-    home: Scaffold(
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Text(
-            'Camera & microphone permissions are required.\n'
-            'Please enable them in Settings.',
-            textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 18),
-          ),
-        ),
-      ),
-    ),
-  );
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
-  final CameraDescription camera;
-  const MyApp({super.key, required this.camera});
+  const MyApp({super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'AR Data Streamer',
     theme: ThemeData(primarySwatch: Colors.blue),
-    home: StreamingScreen(camera: camera),
+    home: const StreamingScreen(),
   );
 }
 
 class StreamingScreen extends StatefulWidget {
-  final CameraDescription camera;
-  const StreamingScreen({super.key, required this.camera});
+  const StreamingScreen({super.key});
   @override
   State<StreamingScreen> createState() => _StreamingScreenState();
 }
 
 class _StreamingScreenState extends State<StreamingScreen> {
+  List<CameraDescription>? _cameras;
   CameraController? _controller;
   Future<void>? _initFuture;
+
   WebSocketChannel? _channel;
   StreamSubscription<GyroscopeEvent>? _gyroSub;
   Timer? _frameTimer;
+
   final _ipCtrl = TextEditingController();
-  bool _streaming = false, _camError = false;
+  bool _streaming = false, _camError = false, _hasCamPermission = false;
   String _status = 'Disconnected';
   GyroscopeEvent _gyro = GyroscopeEvent(0, 0, 0, DateTime.now());
 
   @override
   void initState() {
     super.initState();
-    _initCamera();
+    // load available cameras (no permission needed)
+    availableCameras()
+        .then((list) {
+          setState(() => _cameras = list);
+        })
+        .catchError((_) {
+          // if no camera found
+          setState(() => _camError = true);
+        });
+
+    // listen gyro always
     _gyroSub = gyroscopeEvents.listen((e) {
       if (mounted) setState(() => _gyro = e);
     });
-  }
-
-  void _initCamera() {
-    _controller = CameraController(
-      widget.camera,
-      ResolutionPreset.medium,
-      enableAudio: true,
-    );
-    _initFuture = _controller!.initialize().catchError((e) {
-      if (e is CameraException) setState(() => _camError = true);
-    });
-    setState(() {});
   }
 
   @override
@@ -111,8 +72,44 @@ class _StreamingScreenState extends State<StreamingScreen> {
     super.dispose();
   }
 
+  Future<void> _onCameraButtonPressed() async {
+    // ask only for camera
+    final status = await Permission.camera.request();
+    if (!status.isGranted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Camera permission denied')));
+      return;
+    }
+
+    if (_hasCamPermission) return;
+    setState(() => _hasCamPermission = true);
+
+    // initialize controller with back camera
+    final back = _cameras?.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => _cameras!.first,
+    );
+    if (back == null) {
+      setState(() => _camError = true);
+      return;
+    }
+
+    _controller = CameraController(
+      back,
+      ResolutionPreset.medium,
+      enableAudio: false, // no mic
+    );
+    _initFuture = _controller!.initialize().catchError((e) {
+      setState(() => _camError = true);
+    });
+
+    setState(() {});
+  }
+
   void _toggleStream() {
-    if (_controller == null || _camError) return;
+    if (!_hasCamPermission || _camError || _controller == null) return;
+
     if (_streaming) {
       _frameTimer?.cancel();
       _channel?.sink.close();
@@ -123,13 +120,14 @@ class _StreamingScreenState extends State<StreamingScreen> {
     } else {
       final ip = _ipCtrl.text.trim();
       if (ip.isEmpty) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('Enter server IP')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please enter the server IP')),
+        );
         return;
       }
       final url = 'ws://$ip:8765';
       setState(() => _status = 'Connecting to $url …');
+
       try {
         _channel = WebSocketChannel.connect(Uri.parse(url));
         setState(() {
@@ -138,7 +136,7 @@ class _StreamingScreenState extends State<StreamingScreen> {
         });
         _frameTimer = Timer.periodic(
           const Duration(milliseconds: 66),
-          (_) => _send(),
+          (_) => _sendFrame(),
         );
       } catch (e) {
         setState(() => _status = 'Connection failed: $e');
@@ -146,32 +144,66 @@ class _StreamingScreenState extends State<StreamingScreen> {
     }
   }
 
-  Future<void> _send() async {
+  Future<void> _sendFrame() async {
     if (!_streaming || _controller == null || !_controller!.value.isInitialized)
       return;
     try {
       final pic = await _controller!.takePicture();
       final bytes = await pic.readAsBytes();
       final img64 = base64Encode(bytes);
-      final data = {
+      final payload = {
         'frame': img64,
         'gyro': {'x': _gyro.x, 'y': _gyro.y, 'z': _gyro.z},
       };
-      _channel?.sink.add(jsonEncode(data));
+      _channel?.sink.add(jsonEncode(payload));
     } catch (e) {
       debugPrint('Send error: $e');
     }
   }
 
+  Widget _buildPreview() {
+    if (!_hasCamPermission) {
+      return const Center(child: Text('Tap the camera icon to enable preview'));
+    }
+    if (_camError) {
+      return const Center(child: Text('Unable to access camera'));
+    }
+    return FutureBuilder<void>(
+      future: _initFuture,
+      builder: (ctx, snap) {
+        if (snap.connectionState == ConnectionState.done) {
+          return ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: CameraPreview(_controller!),
+          );
+        }
+        return const Center(child: CircularProgressIndicator());
+      },
+    );
+  }
+
   @override
-  Widget build(BuildContext c) => Scaffold(
+  Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: const Text('AR Data Streamer')),
     body: Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
         children: [
+          // camera preview area
           Expanded(child: _buildPreview()),
-          const SizedBox(height: 16),
+
+          const SizedBox(height: 12),
+          // camera-permission button
+          Align(
+            alignment: Alignment.centerLeft,
+            child: IconButton(
+              icon: const Icon(Icons.camera_alt, size: 32),
+              onPressed: _hasCamPermission ? null : _onCameraButtonPressed,
+              tooltip: 'Enable Camera',
+            ),
+          ),
+
+          // IP address input
           TextField(
             controller: _ipCtrl,
             decoration: const InputDecoration(
@@ -181,7 +213,9 @@ class _StreamingScreenState extends State<StreamingScreen> {
             keyboardType: TextInputType.number,
             enabled: !_streaming,
           ),
+
           const SizedBox(height: 16),
+          // status & gyro
           Card(
             child: Padding(
               padding: const EdgeInsets.all(8),
@@ -201,9 +235,11 @@ class _StreamingScreenState extends State<StreamingScreen> {
               ),
             ),
           ),
+
           const SizedBox(height: 16),
+          // start/stop streaming
           ElevatedButton(
-            onPressed: _camError ? null : _toggleStream,
+            onPressed: (_hasCamPermission && !_camError) ? _toggleStream : null,
             style: ElevatedButton.styleFrom(
               backgroundColor: _streaming ? Colors.redAccent : Colors.green,
               padding: const EdgeInsets.symmetric(horizontal: 50, vertical: 20),
@@ -215,44 +251,4 @@ class _StreamingScreenState extends State<StreamingScreen> {
       ),
     ),
   );
-
-  Widget _buildPreview() {
-    if (_camError) {
-      return const Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.videocam_off, size: 64, color: Colors.red),
-            SizedBox(height: 16),
-            Text(
-              'Camera access denied.\nEnable in Settings.',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 18),
-            ),
-          ],
-        ),
-      );
-    }
-    return FutureBuilder<void>(
-      future: _initFuture,
-      builder: (ctx, snap) {
-        if (snap.connectionState == ConnectionState.done) {
-          return Container(
-            decoration: BoxDecoration(
-              border: Border.all(
-                color: _streaming ? Colors.green : Colors.red,
-                width: 3,
-              ),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(5),
-              child: CameraPreview(_controller!),
-            ),
-          );
-        }
-        return const Center(child: CircularProgressIndicator());
-      },
-    );
-  }
 }
