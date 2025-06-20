@@ -1,0 +1,24 @@
+workflows:
+  sample-workflow:
+    name: Codemagic Sample Workflow
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+    environment:
+      flutter: stable
+      xcode: latest
+    scripts:
+      - name: Modify Podfile for permission_handler
+        script: |
+          if [ -f ios/Podfile ]; then
+            echo "Modifying Podfile to add permission_handler macros"
+            perl -0777 -i -pe 's/(post_install do \|installer\|.*?flutter_post_install\(installer\))/\1\n  installer.pods_project.targets.each do \|target\|\n    target.build_configurations.each do \|config\|\n      config.build_settings["GCC_PREPROCESSOR_DEFINITIONS"] ||= ["$(inherited)", "PERMISSION_CAMERA=1", "PERMISSION_MICROPHONE=1"]\n    end\n  end/s' ios/Podfile
+          fi
+
+      - name: Build iOS unsigned
+        script: |
+          flutter build ios --no-codesign
+
+    artifacts:
+      - build/ios/iphoneos/*.app
+      - build/ios/iphoneos/*.ipa
+      - build/ios/archive/*.xcarchive
