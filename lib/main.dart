@@ -38,7 +38,8 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _checkPermissionAndInitCamera() async {
-    if (await Permission.camera.isGranted) {
+    final status = await Permission.camera.status;
+    if (status.isGranted) {
       _initializeCamera();
     } else {
       final result = await Permission.camera.request();
@@ -57,7 +58,7 @@ class _CameraScreenState extends State<CameraScreen> {
           (_) => CupertinoAlertDialog(
             title: const Text("Camera Permission"),
             content: const Text(
-              "Camera access is required to use this feature.",
+              "Camera access is required to use this feature. Please grant permission in settings.",
             ),
             actions: [
               CupertinoDialogAction(
@@ -77,15 +78,56 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   void _initializeCamera() async {
-    if (cameras.isEmpty) return;
+    // Ensure cameras list is not empty
+    if (cameras.isEmpty) {
+      if (!mounted) return;
+      showCupertinoDialog(
+        context: context,
+        builder:
+            (_) => CupertinoAlertDialog(
+              title: const Text('Error'),
+              content: const Text('No cameras available.'),
+              actions: [
+                CupertinoDialogAction(
+                  child: const Text('OK'),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              ],
+            ),
+      );
+      return;
+    }
 
-    _controller = CameraController(cameras[0], ResolutionPreset.medium);
+    // Initialize the camera controller
+    _controller = CameraController(
+      cameras[0], // Use the first available camera
+      ResolutionPreset.medium,
+    );
 
-    await _controller!.initialize();
-    if (!mounted) return;
-    setState(() {
-      _isCameraInitialized = true;
-    });
+    try {
+      await _controller!.initialize();
+      if (mounted) {
+        setState(() {
+          _isCameraInitialized = true;
+        });
+      }
+    } on CameraException catch (e) {
+      if (!mounted) return;
+      showCupertinoDialog(
+        context: context,
+        builder:
+            (_) => CupertinoAlertDialog(
+              title: const Text('Error'),
+              content: Text('Failed to initialize camera: ${e.description}'),
+              actions: [
+                CupertinoDialogAction(
+                  child: const Text('OK'),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              ],
+            ),
+      );
+    }
   }
 
   @override
